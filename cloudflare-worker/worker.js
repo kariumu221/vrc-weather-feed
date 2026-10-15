@@ -10,7 +10,11 @@ const CURRENT_FIELDS = [
   "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m", "temperature_2m", "visibility",
 ].join(",");
 
-const CACHE_SECONDS = 900; // 15 minutes
+const CACHE_SECONDS = 1800; // 30 minutes, the same as the world's refresh interval
+
+// In-memory cache per Worker instance. The Cache API below only works on custom domains,
+// so on *.workers.dev this is what keeps repeat requests from reaching Open-Meteo.
+const memoryCache = new Map();
 
 function round(value, digits) {
   const f = Math.pow(10, digits);
@@ -41,9 +45,14 @@ export default {
     const cache = caches.default;
     const cacheKey = new Request(`https://weather-cache.invalid/${gridLat}/${gridLon}`);
 
+    const memoryKey = `${gridLat}/${gridLon}`;
+    const now = Date.now();
     let current = null;
-    const cached = await cache.match(cacheKey);
-    if (cached) {
+    const remembered = memoryCache.get(memoryKey);
+    const cached = remembered && remembered.expires > now ? null : await cache.match(cacheKey);
+    if (remembered && remembered.expires > now) {
+      current = remembered.data;
+    } else if (cached) {
       current = await cached.json();
     } else {
       const url = "https://api.open-meteo.com/v1/forecast" +
@@ -55,6 +64,10 @@ export default {
       ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify(current), {
         headers: { "cache-control": `public, max-age=${CACHE_SECONDS}` },
       })));
+    }
+    if (!remembered || remembered.expires <= now) {
+      if (memoryCache.size > 5000) memoryCache.clear();
+      memoryCache.set(memoryKey, { expires: now + CACHE_SECONDS * 1000, data: current });
     }
 
     return json({
