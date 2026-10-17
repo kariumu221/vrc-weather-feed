@@ -38,6 +38,8 @@ VRChat ワールドの天気システムに、天気データを配る仕組み�
 
 以降は、ワークフローが10分おきに起動し、公開中の `weather.json` が50分以上古いときだけ新しく取得して公開します（だいたい1時間ごとの更新）。GitHub の定期実行は混雑していると遅れたり飛ばされたりしますが、起動の回数を多くしているので、いくつか飛ばされても1時間前後で更新されます。新しいときは何もせずに終わるので、Open-Meteo への問い合わせは多くても1時間に1回強です（無料枠の約2割）。すぐに更新したいときは、手順6と同じく「Run workflow」で手動実行してください（手動のときは古さに関係なく更新します）。
 
+ただし実際には、GitHub の定期実行は数時間まったく動かないことがあります。公開ワールドでは、Cloudflare Worker から毎時確実に起動する設定（「4. 安全のための設定」の「定期更新を確実にする」）もしておくことをおすすめします。
+
 GitHub は60日間動きのないリポジトリの定期実行を止めますが、このワークフローは50日ごとに空のコミットをして止まらないようにしています。
 
 ## 2. Cloudflare Worker（任意・市区町村レベル）
@@ -94,6 +96,28 @@ Worker に鍵（シークレット `ACCESS_KEY`）を設定すると、URL の�
 3. 「Logpush」を設定していないことを確かめる（初期状態では設定されていません）
 
 「Real-time Logs（Log Stream）」は、ダッシュボードで開いている間だけ流れて保存されないので、そのままで構いません。
+
+### 定期更新を確実にする（Cloudflare の Cron Trigger）
+
+GitHub の定期実行（`schedule`）は混んでいると数時間遅れるため、Worker が10分ごとに `weather.json` の古さを確かめ、50分以上古ければ GitHub にワークフローの実行を頼みます（`workflow_dispatch`）。ワークフロー側でももう一度古さを確かめるので、GitHub 自身の定期実行と重なっても更新は1回だけです。Open-Meteo への問い合わせ回数は今までと同じ上限（多くても1時間に1回強）のままです。
+
+1. 新しい `worker.js` をデプロイする（手順2の4。下の設定をするまでは、この機能は何もしません）
+2. GitHub でトークンを作る：右上のアイコン →「Settings」→ 左下の「Developer settings」→「Personal access tokens」→「Fine-grained tokens」→「Generate new token」
+   - Token name：わかる名前（例：`vrc-weather-feed-start`）
+   - Expiration：選べる中で長め（例：1年）。期限の前に GitHub からメールが来ます
+   - Repository access：**Only select repositories** で、このリポジトリだけを選ぶ
+   - Permissions → Repository permissions → **Actions** を **Read and write** にする（ほかは触らない）
+   - 「Generate token」を押し、表示されたトークンをコピーする（一度しか表示されません）
+3. Cloudflare で Worker を開き、「Settings」→「Variables and Secrets」→「Add」で次の2つを入れて「Deploy」を押す
+   - Type **Text**、Variable name `GITHUB_REPO`、Value `<GitHubのユーザー名>/<リポジトリ名>`（例：`someone/vrc-weather-feed`）
+   - Type **Secret**、Variable name `GITHUB_TOKEN`、Value 手順2のトークン
+4. 同じ「Settings」の「Trigger Events」（画面によっては「Triggers」）→「Add」→「Cron Triggers」で、`*/10 * * * *`（10分ごと）を追加する
+5. 確かめる：1時間ほどで、GitHub の「Actions」タブに `workflow_dispatch` の実行が出てくれば完了です。Worker の Cron の過去の実行（Past cron events）で、失敗が続いていないかも見られます
+
+- トークンでできるのは、このリポジトリの Actions（ワークフローの実行・取り消しなど）だけで、コードは変えられません。漏れたかもしれないときは、GitHub でそのトークンを削除してください
+- トークンの期限が切れると Cron の実行が「失敗」になり、GitHub 自身の定期実行だけに戻ります。新しいトークンを作って `GITHUB_TOKEN` を入れ替えてください
+- Worker の無料枠への影響は1日144回で、ほとんどありません。公開リポジトリなので Actions の実行も無料です
+- 公開中の `weather.json` が GitHub Pages 以外の場所にあるときは、Text の `FEED_URL` にその URL を入れます。ワークフローが `main` 以外のブランチにあるときは `GITHUB_BRANCH` で指定します
 
 ### URL に出る名前
 

@@ -12,7 +12,14 @@ on:
     # so one update is about 73 calls: at most ~29 updates/day = ~2,100 calls/day (~64,000/month).
     # More locations raise it proportionally.
     - cron: "3-59/10 * * * *"
-  workflow_dispatch:   # a manual run always updates
+  # Also started by the Cloudflare Worker's Cron Trigger (cloudflare-worker/worker.js) with force=false,
+  # because GitHub's schedule above is often hours late. A manual run from the Actions tab always updates.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Update even if the published data is new"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -39,8 +46,9 @@ jobs:
           made=$(curl -fsSL --max-time 20 "$url?check=$(date +%s)" | python3 -c "import json, sys; print(int(json.load(sys.stdin).get('t', 0)))" 2>/dev/null || echo 0)
           age=$(( ($(date +%s) - ${made:-0}) / 60 ))
           echo "Published data is $age minutes old"
-          # Update when it is 50 minutes old or more, when it can't be read (age is huge), or on a manual run.
-          if [ "$age" -ge 50 ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # Update when it is 50 minutes old or more, when it can't be read (age is huge), or on a manual run
+          # (a run started by the Worker passes force=false and goes by the age like the schedule).
+          if [ "$age" -ge 50 ] || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" != "false" ]; }; then
             echo "stale=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"

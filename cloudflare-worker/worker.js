@@ -72,7 +72,62 @@ function tooOften(tag, now) {
   return entry.count > RATE_MAX;
 }
 
+// ---- Starting the regional feed update (Cron Trigger) ----
+// GitHub often runs the feed workflow's own schedule hours late, so this Worker starts it too. On its Cron Trigger
+// (every 10 minutes) it reads the published weather.json and, when that is FEED_STALE_MINUTES old or more, asks
+// GitHub to run the workflow (workflow_dispatch with force=false). The workflow checks the age again, so a run
+// started twice, or one GitHub also started on its own, updates only once. Settings > Variables and Secrets:
+//   GITHUB_REPO   (text)   owner/name of the feed repository
+//   GITHUB_TOKEN  (secret) a fine-grained token for that repository only, with "Actions: Read and write"
+//   FEED_URL      (text, optional) the published weather.json, if not https://<owner>.github.io/<name>/weather.json
+//   GITHUB_BRANCH (text, optional) the branch with the workflow, if not main
+// Without GITHUB_REPO and GITHUB_TOKEN this part does nothing.
+const FEED_STALE_MINUTES = 50;   // the same rule as the workflow's "Is the published data old?"
+const FEED_WORKFLOW = "update-weather.yml";
+const USER_AGENT = "VRChat-WeatherFeed/1.0";
+
+// Minutes since the published feed was made; Infinity when it can't be read (then an update is due anyway).
+async function feedAgeMinutes(feedUrl, now) {
+  try {
+    // The query string skips the Pages cache, which can serve the old file for up to 10 minutes.
+    const res = await fetch(feedUrl + (feedUrl.includes("?") ? "&" : "?") + "check=" + now, { headers: { "user-agent": USER_AGENT } });
+    if (!res.ok) return Infinity;
+    const t = Number((await res.json()).t);
+    return t > 0 ? (now / 1000 - t) / 60 : Infinity;
+  } catch (e) {
+    return Infinity;
+  }
+}
+
+async function startFeedUpdate(env, now) {
+  const repo = env && env.GITHUB_REPO;
+  const token = env && env.GITHUB_TOKEN;
+  if (!repo || !token) return "not set up";
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("GITHUB_REPO should look like owner/name");
+  const [owner, name] = repo.split("/");
+  const feedUrl = env.FEED_URL || `https://${owner.toLowerCase()}.github.io/${name}/weather.json`;
+  if (await feedAgeMinutes(feedUrl, now) < FEED_STALE_MINUTES) return "fresh";
+  const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/${FEED_WORKFLOW}/dispatches`, {
+    method: "POST",
+    headers: {
+      "authorization": "Bearer " + token,
+      "accept": "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "content-type": "application/json",
+      "user-agent": USER_AGENT,
+    },
+    body: JSON.stringify({ ref: env.GITHUB_BRANCH || "main", inputs: { force: "false" } }),
+  });
+  // Throwing marks the run as failed in the Worker's list of past cron events (an expired token shows up there).
+  if (!res.ok) throw new Error("GitHub did not start the feed update: " + res.status);
+  return "started";
+}
+
 export default {
+  async scheduled(controller, env, ctx) {
+    await startFeedUpdate(env, Date.now());
+  },
+
   async fetch(request, env, ctx) {
     if (request.method !== "GET") return json({ v: 1, src: "ip", error: "method not allowed" }, 405);
     const key = env && env.ACCESS_KEY;
