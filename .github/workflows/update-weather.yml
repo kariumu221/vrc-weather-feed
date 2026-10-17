@@ -2,15 +2,17 @@ name: Update weather feed
 
 on:
   schedule:
-    # Twice an hour, away from the top of the hour. GitHub delays or skips scheduled runs
-    # when it is busy, and around :00 is the busiest time.
+    # Every 10 minutes, away from the top of the hour. GitHub delays or skips many scheduled runs
+    # when it is busy, so the workflow starts often and only updates when the published data is
+    # 50 minutes old or more (see "Is the published data old?"). That keeps it about hourly even
+    # when most runs are dropped, while Open-Meteo is asked at most a little over once an hour.
     # Open-Meteo free tier: 10,000 calls/day, 5,000/hour, 600/minute, 300,000/month.
-    # Each run is one request for 66 locations x 11 variables. Open-Meteo counts every
+    # Each update is one request for 66 locations x 11 variables. Open-Meteo counts every
     # location as a call, and 1.1 calls when more than 10 variables are asked for,
-    # so one run is about 73 calls: ~146/hour, ~3,500/day, ~108,000/month.
-    # That leaves room for retries and manual runs. More locations raise it proportionally.
-    - cron: "23,53 * * * *"
-  workflow_dispatch:
+    # so one update is about 73 calls: at most ~29 updates/day = ~2,100 calls/day (~64,000/month).
+    # More locations raise it proportionally.
+    - cron: "3-59/10 * * * *"
+  workflow_dispatch:   # a manual run always updates
 
 permissions:
   contents: write
@@ -19,23 +21,30 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  check:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    outputs:
+      stale: ${{ steps.age.outputs.stale }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build weather.json
-        run: python scripts/build_weather.py public
+      - name: Is the published data old?
+        id: age
+        run: |
+          url="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/weather.json"
+          # The query string skips the Pages cache, which can serve the old file for up to 10 minutes.
+          made=$(curl -fsSL --max-time 20 "$url?check=$(date +%s)" | python3 -c "import json, sys; print(int(json.load(sys.stdin).get('t', 0)))" 2>/dev/null || echo 0)
+          age=$(( ($(date +%s) - ${made:-0}) / 60 ))
+          echo "Published data is $age minutes old"
+          # Update when it is 50 minutes old or more, when it can't be read (age is huge), or on a manual run.
+          if [ "$age" -ge 50 ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # GitHub turns off scheduled workflows in repositories with no activity for 60 days.
       # An empty commit every ~50 days keeps the schedule alive.
@@ -49,6 +58,23 @@ jobs:
             git commit --allow-empty -m "Keep scheduled weather updates active"
             git push
           fi
+
+  build-and-deploy:
+    needs: check
+    if: needs.check.outputs.stale == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build weather.json
+        run: python scripts/build_weather.py public
 
       - uses: actions/configure-pages@v5
 
