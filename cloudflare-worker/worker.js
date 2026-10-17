@@ -8,7 +8,9 @@
 // Access from the world only: give the Worker a secret named ACCESS_KEY (Settings > Variables and Secrets) and put
 // the same value in the world's City Url as ?k=... Requests without it are refused (403). The key travels with the
 // world (VRChat even writes the URL to its own log), so it keeps away casual use from elsewhere rather than being a
-// true secret; the per-address limit is what protects the free daily quota.
+// true secret. Refused requests still count toward the free daily quota, so neither the key nor the limit below can
+// stop someone using it up on purpose; the world then falls back to the GitHub Pages feed. Only a rate limiting
+// rule in front of the Worker (custom domain + WAF) would.
 // Data: Open-Meteo.com (CC BY 4.0).
 
 const CURRENT_FIELDS = [
@@ -18,7 +20,9 @@ const CURRENT_FIELDS = [
 
 const CACHE_SECONDS = 1800; // 30 minutes; the world asks about once an hour
 
-// Per address: at most RATE_MAX requests in RATE_WINDOW_MS. A visitor asks about once an hour (a few more while
+// Per address: at most RATE_MAX requests in RATE_WINDOW_MS, counted per Worker instance. Cloudflare spreads requests
+// over many instances that don't share the count, so this only stops bursts that land on one instance (in a test,
+// 38 requests in a row from one address were all answered). A visitor asks about once an hour (a few more while
 // retrying); the margin leaves room for several players behind one connection (a household, a shared network).
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 20;
