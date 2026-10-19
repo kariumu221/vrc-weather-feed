@@ -15,9 +15,17 @@
 //   turns this check off (for example if VRChat changes its User-Agent).
 // The key travels with the world (VRChat even writes the URL to its own log), and a User-Agent can be faked, so
 // both keep away casual use from elsewhere (a browser, another site or world) rather than being a true secret.
-// Refused requests still count toward the free daily quota, so nothing here can stop someone using it up on
-// purpose; the world then falls back to the GitHub Pages feed. Only a rate limiting rule in front of the Worker
-// (custom domain + WAF) would.
+//
+// Floods (DoS): Cloudflare absorbs network-level floods by itself. A flood of ordinary-looking requests is met in
+// two places:
+// - In front of the Worker (the real defence; README "DoS への対策"): on a custom domain, WAF rules block
+//   requests without the key or VRChat's User-Agent and limit each address, before the Worker runs, so they don't
+//   count toward the free daily quota (100,000 a day). The workers.dev address is then turned off.
+// - In the Worker (here): refusals are cheap (the checks that cost nothing come first), each address is limited,
+//   and Open-Meteo is protected: at most UPSTREAM_MAX_PER_MINUTE calls a minute per instance, and a pause after it
+//   refuses or fails, so a flood from many places can't use up Open-Meteo's free limit. Requests that reach the
+//   Worker still count toward its quota; when that runs out, the world simply uses the GitHub Pages feed until the
+//   quota comes back (00:00 UTC).
 // Data: Open-Meteo.com (CC BY 4.0).
 
 const CURRENT_FIELDS = [
@@ -58,6 +66,17 @@ const RESPONSE_HEADERS = {
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 20;
 const rateBook = new Map();
+
+// Calls to Open-Meteo, per Worker instance. Requests from many places at once (each a new 10 km cell, so the cache
+// can't answer them) would otherwise become as many Open-Meteo calls and could use up its free daily limit. At most
+// UPSTREAM_MAX_PER_MINUTE a minute, and none for UPSTREAM_PAUSE_MS after Open-Meteo refuses or fails (429, 5xx,
+// timeout). Those visitors get 503 and see the regional feed until their next try; cells already in the cache are
+// still answered. Real use is far below this: each visitor asks about once an hour.
+const UPSTREAM_MAX_PER_MINUTE = 30;
+const UPSTREAM_PAUSE_MS = 60 * 1000;
+let upstreamWindowStart = 0;
+let upstreamCalls = 0;
+let upstreamPausedUntil = 0;
 // A random salt per Worker instance, so the address hashes in memory can't be turned back into addresses.
 // Made on the first request: Workers can't make random values at startup.
 let salt = "";
@@ -128,6 +147,21 @@ function tooOften(tag, now) {
   }
   entry.count++;
   return entry.count > RATE_MAX;
+}
+
+function upstreamAvailable(now) {
+  if (now < upstreamPausedUntil) return false;
+  if (now - upstreamWindowStart >= 60 * 1000) {
+    upstreamWindowStart = now;
+    upstreamCalls = 0;
+  }
+  if (upstreamCalls >= UPSTREAM_MAX_PER_MINUTE) return false;
+  upstreamCalls++;
+  return true;
+}
+
+function pauseUpstream(now) {
+  upstreamPausedUntil = now + UPSTREAM_PAUSE_MS;
 }
 
 function currentLooksRight(current) {
@@ -218,8 +252,8 @@ export default {
     if (request.method !== "GET") return refuse("method not allowed", 405);
     const url = new URL(request.url);
     if (url.pathname !== "/") return refuse("not found", 404);
-    const keyOk = await keyAccepted(url.searchParams.get("k") || "", env);
-    if (!keyOk || !fromVRChat(request, env)) return refuse("forbidden", 403);
+    // The checks that cost nothing first, the key (two hashes) after them.
+    if (!fromVRChat(request, env) || !(await keyAccepted(url.searchParams.get("k") || "", env))) return refuse("forbidden", 403);
     if (tooOften(await addressTag(request), Date.now())) return refuse("too many requests", 429);
 
     const cf = request.cf || {};
@@ -246,6 +280,7 @@ export default {
       if (!currentLooksRight(current)) current = null;
     }
     if (!current) {
+      if (!upstreamAvailable(now)) return refuse("busy", 503);
       const upstream = "https://api.open-meteo.com/v1/forecast" +
         `?latitude=${gridLat}&longitude=${gridLon}` +
         `&current=${CURRENT_FIELDS}&wind_speed_unit=ms&timezone=GMT`;
@@ -253,9 +288,13 @@ export default {
       try {
         res = await fetchWithin(upstream, { headers: { "user-agent": USER_AGENT } }, UPSTREAM_TIMEOUT_MS);
       } catch (e) {
+        pauseUpstream(now);
         return refuse("upstream timeout", 504);
       }
-      if (!res.ok) return refuse("upstream " + res.status, 502);
+      if (!res.ok) {
+        if (res.status === 429 || res.status >= 500) pauseUpstream(now);
+        return refuse("upstream " + res.status, 502);
+      }
       try {
         current = (await res.json()).current;
       } catch (e) {

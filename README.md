@@ -57,7 +57,7 @@ GitHub は60日間動きのないリポジトリの定期実行を止めます�
 
 無料枠（1日10万リクエスト）で十分です。同じ地域（約10km四方）の結果は30分キャッシュするので、Open-Meteo への問い合わせも少なく済みます。同じ IP アドレスからの連続アクセスは、10分間に20回を超えると断ります（429）。ただしこの回数は Worker のインスタンスごとに数えていて、Cloudflare はアクセスを複数のインスタンスに振り分けるので、確実な上限ではありません（実測では、同じ回線から38回続けても断られませんでした）。
 
-断ったアクセス（403・429）も Cloudflare の1日10万回に数えられます。そのため、URL を知っている人がわざと大量にアクセスすると、その日の枠を使い切られることはあります（鍵がなくても同じです）。そうなってもワールドは地域データに切り替わるだけで、壊れません（日本時間の朝9時に枠が戻ります）。確実に防ぎたいときは、独自ドメインを Worker に付けて Cloudflare のレート制限ルール（WAF。無料プランでも1つ使えます）を設定します。Worker に届く前に止まるので、枠を使いません。
+断ったアクセス（403・429）も Cloudflare の1日10万回に数えられます。そのため、URL を知っている人がわざと大量にアクセスすると、その日の枠を使い切られることはあります（鍵がなくても同じです）。そうなってもワールドは地域データに切り替わるだけで、壊れません（日本時間の朝9時に枠が戻ります）。確実に防ぐ方法は「4. 安全のための設定」の「DoS（大量アクセス）への対策」にまとめています。
 
 ## 3. Unity に URL を設定する
 
@@ -136,6 +136,54 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 - トークンの期限が切れると Cron の実行が「失敗」になり、GitHub 自身の定期実行だけに戻ります。新しいトークンを作って `GITHUB_TOKEN` を入れ替えてください
 - Worker の無料枠への影響は1日144回で、ほとんどありません。公開リポジトリなので Actions の実行も無料です
 - 公開中の `weather.json` が GitHub Pages 以外の場所にあるときは、Text の `FEED_URL` にその URL を入れます。ワークフローが `main` 以外のブランチにあるときは `GITHUB_BRANCH` で指定します
+
+### DoS（大量アクセス）への対策
+
+守りは3段になっています。
+
+1. **Cloudflare 自体**：回線をあふれさせるような大きな攻撃（DDoS）は、無料プランでも Cloudflare が自動で吸収します
+2. **Worker の中（`worker.js`）**
+   - 断る確認は、手間のかからないもの（パス・User-Agent など）から先にして、断るときの負担を小さくしています
+   - 同じアドレスからの回数制限（10分に20回）
+   - **Open-Meteo を守る**：Open-Meteo への問い合わせは、Worker のインスタンスごとに1分30回まで。Open-Meteo が断ったり失敗したり（429・5xx・時間切れ）したら1分間は問い合わせない。あちこちの場所から一度に大量に来ても（約10km四方ごとに別の問い合わせになるのでキャッシュが効かない）、Open-Meteo の無料枠を使い切られません。その間の来場者には 503 を返し、ワールドは地域データを使います。キャッシュにある場所には今までどおり答えます
+   - それでも、**Worker に届いたアクセスは、断ったものも1日10万回の枠に数えられます**。使い切られると、その日はワールドが地域データに切り替わります（壊れはしません。日本時間の朝9時に枠が戻ります）
+3. **Worker の手前（本当の対策・独自ドメインが必要）**：Cloudflare の WAF で、鍵のないアクセスや VRChat 以外からのアクセス、同じアドレスからの連続アクセスを、Worker が動く前に止めます。止めたアクセスは Worker の枠を使いません
+
+#### 3段目の設定（独自ドメインと WAF）
+
+`*.workers.dev` には WAF のルールを付けられないため、Cloudflare に置いた自分のドメインが必要です。
+
+1. **ドメインを用意する**：持っていなければ、Cloudflare の「Domain Registration」→「Register Domains」で買えます（年1,500円前後から。種類によって違います）。ほかで買ったドメインは、「Add a domain」で Cloudflare に追加し（Free プラン）、案内どおりネームサーバーを切り替えます
+2. **Worker にドメインを付ける**：Worker の「Settings」→「Domains & Routes」→「Add」→「Custom domain」で、`weather.<あなたのドメイン>` のような名前を付ける
+3. **WAF のカスタムルール**（無料で5つまで）：そのドメインの「Security」→「WAF」→「Custom rules」→「Create rule」
+   - Rule name：`VRChat 以外を止める`
+   - 「Edit expression」を開き、次を貼り付けて、`weather.<あなたのドメイン>` と `<鍵>` を自分のものに書き換える
+
+     ```
+     (http.host eq "weather.<あなたのドメイン>" and (http.request.method ne "GET" or http.request.uri.path ne "/" or not (starts_with(http.user_agent, "UnityPlayer/") or starts_with(http.user_agent, "VRChat/")) or not http.request.uri.query contains "k=<鍵>"))
+     ```
+
+   - 画面が式を受け付けないときは、`starts_with(http.user_agent, "UnityPlayer/")` を `http.user_agent contains "UnityPlayer/"` に（VRChat/ も同じように）書き換えてください（無料プランは正規表現が使えません）
+   - Action：**Block** →「Deploy」
+4. **レート制限ルール**（無料で1つ）：同じ「WAF」→「Rate limiting rules」→「Create rule」
+   - Rule name：`連続アクセスを止める`
+   - If incoming requests match：Field `Hostname`、Operator `equals`、Value `weather.<あなたのドメイン>`
+   - With the same characteristics：IP（無料プランはこれだけ）
+   - When rate exceeds：Requests **10**、Period **10 seconds**（来場者は1時間に1回ほどなので、同じ回線から何人か同時に入っても十分な余裕です）
+   - Then take action：**Block**、Duration **10 seconds** →「Deploy」
+5. **ワールドの URL を変える**：Unity の **City Url** を `https://weather.<あなたのドメイン>/?k=<鍵>` にしてアップロードする
+6. **workers.dev を止める**：古い版のワールドにいる人が抜けたころ（数日後）、Worker の「Settings」→「Domains & Routes」で **workers.dev** と **Preview URLs** を Disable にする。オンのままだと、WAF のない workers.dev の URL に直接アクセスされて、手前の守りを回り道されます
+
+注意：
+
+- このドメインでは **Bot Fight Mode** と **I'm Under Attack Mode** をオンにしないでください。ブラウザ向けの確認画面が出るので、VRChat の読み込みも止まってしまいます
+- 独自ドメインも VRChat の許可リストにはないので、届くのは今までどおり「Allow Untrusted URLs」をオンにした人だけです
+- Cron Trigger（定期更新の起動）は URL を使わないので、workers.dev を止めても動き続けます
+
+#### 攻撃されているかの見方と、急いで止めたいとき
+
+- Worker の「Metrics」で、1日のリクエスト数が急に増えていないかを見ます。10万回を超えると Cloudflare が error 1027 を返し、ワールドは地域データに切り替わります
+- 独自ドメインがまだないときに急いで止めたいときは、Worker の「Settings」→「Domains & Routes」で **workers.dev** を Disable にします。アクセスが Worker に届かなくなるので枠を使わず、ワールドは地域データに切り替わります（定期更新の起動は続きます）。落ち着いたら Enable に戻します
 
 ### Worker のその他の守り
 
