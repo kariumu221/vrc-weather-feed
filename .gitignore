@@ -1,3 +1,9 @@
 public/
 __pycache__/
+# Secrets never go to GitHub: the Worker's access key, and any local env / key files.
 cloudflare-worker/ACCESS_KEY.txt
+*.key
+*.pem
+.env
+.env.*
+.dev.vars

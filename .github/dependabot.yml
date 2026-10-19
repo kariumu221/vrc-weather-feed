@@ -1,0 +1,7 @@
+# Proposes updates (as pull requests) to the GitHub Actions the workflow uses, which are pinned to commit SHAs.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

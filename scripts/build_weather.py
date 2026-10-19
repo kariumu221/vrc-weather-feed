@@ -5,6 +5,7 @@ so no location is ever requested from the visitor. Data: Open-Meteo (CC BY 4.0),
 Standard library only, so it runs on a bare GitHub Actions runner.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -113,6 +114,21 @@ def num(value, digits=1):
     return round(float(value), digits) if value is not None else 0
 
 
+# Sensible ranges for every published value (the same ones the world checks). A value outside them means
+# Open-Meteo sent something unexpected: nothing is published, and the last good feed stays online.
+LIMITS = {
+    "c": (0, 99), "cc": (0, 100), "p": (0, 500), "r": (0, 500), "s": (0, 500), "ws": (0, 150),
+    "wd": (0, 360), "wg": (0, 200), "tp": (-90, 60), "vis": (0, 1000000),
+}
+
+
+def check_entry(entry):
+    for key, (low, high) in LIMITS.items():
+        value = entry[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+            raise SystemExit(f"{entry['n']}: {key}={value!r} is outside {low}..{high}; not publishing")
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "public"
     results = fetch_current(LOCATIONS)
@@ -135,6 +151,7 @@ def main():
             "tp": num(cur.get("temperature_2m")),
             "vis": num(cur.get("visibility"), 0),
         })
+        check_entry(entries[-1])
 
     doc = {"v": 1, "t": int(time.time()), "src": "tz", "attr": "Weather data by Open-Meteo.com (CC BY 4.0)", "l": entries}
     os.makedirs(out_dir, exist_ok=True)

@@ -48,13 +48,12 @@ GitHub は60日間動きのないリポジトリの定期実行を止めます�
 2. 左メニューの「Workers & Pages」→「Create」→「Create Worker」を開く
 3. 名前を入力（例：`vrc-weather`）して「Deploy」を押す
 4. 「Edit code」を開き、中身をすべて `cloudflare-worker/worker.js` の内容に置き換えて「Deploy」を押す
-5. 表示される URL をブラウザで開き、自分の地域の天気の JSON が表示されれば完了です
+5. 続けて「4. 安全のための設定」の鍵（`ACCESS_KEY`）とログの設定をする。**鍵を設定するまで、Worker はすべてのアクセスを断ります**（設定を消してしまっても勝手に誰でも使える状態にならないように）
+6. 確かめ方は「4. 安全のための設定」の「Worker の鍵」の手順5を見てください。Worker の URL はこの形です
 
    ```
    https://vrc-weather.<あなたのサブドメイン>.workers.dev/
    ```
-
-6. 公開ワールドで使うときは、続けて「4. 安全のための設定」の鍵とログの設定をしてください
 
 無料枠（1日10万リクエスト）で十分です。同じ地域（約10km四方）の結果は30分キャッシュするので、Open-Meteo への問い合わせも少なく済みます。同じ IP アドレスからの連続アクセスは、10分間に20回を超えると断ります（429）。ただしこの回数は Worker のインスタンスごとに数えていて、Cloudflare はアクセスを複数のインスタンスに振り分けるので、確実な上限ではありません（実測では、同じ回線から38回続けても断られませんでした）。
 
@@ -74,20 +73,37 @@ GitHub は60日間動きのないリポジトリの定期実行を止めます�
 
 ### Worker の鍵（ワールド経由だけで使えるようにする）
 
-Worker に鍵（シークレット `ACCESS_KEY`）を設定すると、URL の末尾に同じ鍵（`?k=<鍵>`）が付いたアクセスだけに答え、ほかは断ります（403）。
+Worker は、次の両方を満たすアクセスにだけ答え、ほかは理由を言わずに断ります（403）。
+
+- URL の末尾に、シークレット `ACCESS_KEY` と同じ鍵（`?k=<鍵>`）が付いている。`ACCESS_KEY` が設定されていないときは、誰にも答えません
+- VRChat の文字列の読み込みから来ている：User-Agent が `UnityPlayer/`（PC・Android）か `VRChat/`（iOS）で始まり、ブラウザが付ける情報（`Origin`、`Sec-Fetch-*`）がない。VRChat のログから鍵を拾った人が、ブラウザやほかのサイトからそのまま使うのを防ぎます。VRChat の User-Agent が変わって市区町村の天気が届かなくなったときは、Text の変数 `ALLOW_ANY_AGENT` に `1` を入れると、この確認だけを止められます
 
 1. 鍵を用意する：`cloudflare-worker/ACCESS_KEY.txt`（このファイルは `.gitignore` で除外しているので、GitHub には上がりません）。なければ、英数字32文字くらいの長いランダムな文字列を作って保存します
 2. Unity の **City Url** を `https://vrc-weather.<あなたのサブドメイン>.workers.dev/?k=<鍵>` にして、ワールドをアップロードする
-3. 新しい `worker.js` をデプロイする（手順2の4。鍵を設定するまでは、これまでどおり誰でも使えます）
-4. Cloudflare で Worker を開き、「Settings」→「Variables and Secrets」→「Add」で次を入れて「Deploy」を押す
+3. Cloudflare で Worker を開き、「Settings」→「Variables and Secrets」→「Add」で次を入れて「Deploy」を押す
    - Type：**Secret**
    - Variable name：`ACCESS_KEY`
    - Value：`ACCESS_KEY.txt` の中身
-5. 確かめる：鍵なしの URL をブラウザで開くと `{"error":"forbidden"}`、`?k=<鍵>` 付きなら天気の JSON が出れば完了です
+4. 新しい `worker.js` をデプロイする（手順2の4。すでに鍵を設定してある Worker を新しい `worker.js` にするときは、この手順だけで済みます）
+5. 確かめる
+   - 鍵なしの URL、`?k=<鍵>` 付きの URL のどちらをブラウザで開いても `{"v":1,"src":"ip","error":"forbidden"}` になる（ブラウザは VRChat ではないので断られるのが正しい動きです）
+   - ワールドに入り、VRChat のログ（`%USERPROFILE%\AppData\LocalLow\VRChat\VRChat\output_log_*.txt`）に `[Weather] Using city weather` が出れば完了です。`City download failed (forbidden)` が続くときは、鍵が合っていないか、VRChat の User-Agent が変わっています
+   - パソコンから確かめたいときは、PowerShell で次を実行して天気の JSON が出れば答えています（`<鍵>` は自分で入れます。コマンドの履歴に鍵が残るので、終わったらウィンドウを閉じてください）
+
+     ```
+     curl.exe -A "UnityPlayer/2022.3.22f1-DWR (UnityWebRequest/1.0, libcurl/8.5.0-DEV)" "https://vrc-weather.<あなたのサブドメイン>.workers.dev/?k=<鍵>"
+     ```
 
 手順2のアップロードより先に鍵を設定すると、その間はワールドの市区町村データが断られ、地域データになります（壊れはしません）。鍵を設定すると、鍵の入っていない古いワールドの版も地域データになります。
 
-鍵はワールドのデータと VRChat のログ（読み込んだ URL を書くため）に入るので、完全な秘密ではありません。よそのサイトやワールドから気軽に使われるのを防ぐためのもので、わざと大量にアクセスされたときの対策にはなりません（手順2の最後を参照）。鍵を変えるときも、ワールドを先に更新してから `ACCESS_KEY` を変えます。
+鍵はワールドのデータと VRChat のログ（読み込んだ URL を書くため）に入り、User-Agent はまねできるので、どちらも完全な秘密ではありません。よそのサイトやワールドから気軽に使われるのを防ぐためのもので、わざと大量にアクセスされたときの対策にはなりません（手順2の最後を参照）。
+
+**鍵を変えるとき**（鍵が出回ったと感じたときなど）は、古い鍵のワールドを止めずに切り替えられます。
+
+1. 新しい鍵を作って `ACCESS_KEY.txt` を書き換える
+2. Cloudflare で、今の `ACCESS_KEY` の値を新しく作る Secret `ACCESS_KEY_PREVIOUS` に入れ、`ACCESS_KEY` を新しい鍵に変えて「Deploy」（この間は古い鍵・新しい鍵のどちらでも答えます）
+3. Unity の **City Url** の鍵を新しいものにしてワールドをアップロードする
+4. しばらくして（古い版のワールドにいる人が抜けたころ）、`ACCESS_KEY_PREVIOUS` を消して「Deploy」
 
 ### Worker のログをオフにする
 
@@ -121,6 +137,35 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 - Worker の無料枠への影響は1日144回で、ほとんどありません。公開リポジトリなので Actions の実行も無料です
 - 公開中の `weather.json` が GitHub Pages 以外の場所にあるときは、Text の `FEED_URL` にその URL を入れます。ワークフローが `main` 以外のブランチにあるときは `GITHUB_BRANCH` で指定します
 
+### Worker のその他の守り
+
+`worker.js` は次のこともしています。
+
+- 答えは、キャッシュされない・ページとして表示されない・ほかのサイトに埋め込まれたり読まれたりしない・検索に載らない設定（`no-store`、`nosniff`、`Content-Security-Policy`、`Cross-Origin-Resource-Policy` など）
+- `/` 以外の道（パス）は 404、GET 以外は 405
+- Open-Meteo と GitHub への問い合わせは、8〜10秒で返事がなければあきらめる
+- Open-Meteo の値が範囲外（気温 −90〜60°など）や壊れた形のときは、使わずキャッシュもしない（502）
+- 地名は、タグ・記号の `<` `>`・制御文字を取り除き、40文字までにしてから返す
+- 鍵は SHA-256 にしてから一定時間で比べるので、断るまでの時間から鍵（の長さも）を探れない
+- Cron の設定（`GITHUB_BRANCH`・`FEED_URL`・`GITHUB_REPO`）がおかしな形なら使わない。トークンは `api.github.com` にだけ送り、失敗の記録には状態の番号だけを書く
+
+### GitHub のワークフローの守り
+
+- 権限は最初は何もなしにして、仕事ごとに必要なものだけ（古さの確認：空のコミット用の書き込みだけ。公開：読み取りと Pages への公開だけ）
+- 使っている Actions（`actions/checkout` など）は、タグではなくコミットの番号（SHA）で固定。タグは後から別のコードに付け替えられますが、SHA は変えられません。新しい版は Dependabot（`.github/dependabot.yml`）が月に1回、プルリクエストで知らせます。中身を見て「Merge」すれば更新されます
+- イベントの値は環境変数で渡し、スクリプトの中に直接埋め込まない
+- `scripts/build_weather.py` は、値が範囲外なら公開をやめる（前の `weather.json` が残る）
+
+### アカウント側でしておくこと（おすすめ）
+
+コードでは守れない部分です。どれも一度設定すれば済みます。
+
+- **GitHub と Cloudflare の2段階認証**：アカウントを乗っ取られると、ここに書いた守りは全部意味がなくなります。GitHub は「Settings」→「Password and authentication」、Cloudflare は「My Profile」→「Authentication」
+- **GitHub の Actions の初期権限を読み取りだけに**：リポジトリの「Settings」→「Actions」→「General」→「Workflow permissions」を **Read repository contents and packages permissions** にし、「Allow GitHub Actions to create and approve pull requests」をオフにする（このワークフローは必要な権限を自分で書いているので、そのまま動きます）
+- **GitHub のシークレットの検出**：「Settings」→「Code security」（または「Security」）で **Secret scanning** と **Push protection** がオンか確かめる（鍵やトークンをうっかりコミットしようとすると止めてくれます）
+- **Cloudflare の Preview URLs をオフに**：Worker の「Settings」→「Domains & Routes」で **Preview URLs** を Disable にする。オンのままだと、古い版の Worker（鍵の確認がない版など）を版ごとの URL で呼べることがあります
+- **GitHub のトークン**：今のトークンは「このリポジトリの Actions だけ」の権限のまま、期限が来たら作り直す（「定期更新を確実にする」の注意を参照）
+
 ### URL に出る名前
 
 公開ワールドでは、次の名前が URL として VRChat のログに残り、誰でも見られます。気になる場合は変えられます（どちらも、変えたら新しい URL をワールドに入れてアップロードし直します）。
@@ -135,6 +180,7 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 - VRChat のワールドは、許可されたドメイン（`*.github.io` など）からしか文字列データを読めません。そのため GitHub Pages を経由しています
 - `*.workers.dev` は許可リストにありません。そのため Worker は「Allow Untrusted URLs」をオンにした人にだけ届きます。届かない人は、自動で GitHub Pages のデータを使います
 - Worker の答えには、Cloudflare が推定した街の名前と、約10km単位に丸めた緯度・経度が入ります。ワールドはこれを各自の画面に出すだけで、ほかの人には送りません
+- 街の名前の細かさは、Cloudflare が接続元（プロバイダーの回線）をどこまで知っているかで決まります。街まで分からない回線では、都道府県などの名前（それもなければ国の記号）になります。来場者に場所を尋ねない限り、これより細かくはできません
 - 地点の一覧を変えたいときは `scripts/build_weather.py` の `LOCATIONS` を編集します
   - 書式：`(名前, 緯度, 経度, 標準時差(分), 夏時間あり, 言語ヒント)`
   - 同じ時差の地点が複数あるときは、VRChat の表示言語が一致するものを優先し、なければ上にあるものを使います
