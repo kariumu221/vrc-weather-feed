@@ -98,12 +98,22 @@ Worker は、次の両方を満たすアクセスにだけ答え、ほかは理�
 
 鍵はワールドのデータと VRChat のログ（読み込んだ URL を書くため）に入り、User-Agent はまねできるので、どちらも完全な秘密ではありません。よそのサイトやワールドから気軽に使われるのを防ぐためのもので、わざと大量にアクセスされたときの対策にはなりません（手順2の最後を参照）。
 
-**鍵を変えるとき**（鍵が出回ったと感じたときなど）は、古い鍵のワールドを止めずに切り替えられます。
+**鍵を変えるとき**（鍵が出回ったと感じたときなど）は、古い鍵のワールドを止めずに切り替えられます。鍵は Worker・WAF の式（「DoS への対策」の3段目を設定したとき）・ワールドの3か所にあるので、3か所ともそろえて変えます。先に WAF と Worker を「古い鍵・新しい鍵のどちらでも通す」状態にしてからワールドを上げ、最後に古い鍵を外します。
 
-1. 新しい鍵を作って `ACCESS_KEY.txt` を書き換える
-2. Cloudflare で、今の `ACCESS_KEY` の値を新しく作る Secret `ACCESS_KEY_PREVIOUS` に入れ、`ACCESS_KEY` を新しい鍵に変えて「Deploy」（この間は古い鍵・新しい鍵のどちらでも答えます）
-3. Unity の **City Url** の鍵を新しいものにしてワールドをアップロードする
-4. しばらくして（古い版のワールドにいる人が抜けたころ）、`ACCESS_KEY_PREVIOUS` を消して「Deploy」
+1. 新しい鍵を作って `ACCESS_KEY.txt` を書き換える（古い鍵は、手順6が終わるまで控えておく）
+2. **WAF**（設定しているとき）：そのドメインの「Security」→「WAF」→「Custom rules」で `VRChat 以外を止める` を開き、式の最後の `not http.request.uri.query contains "k=<鍵>"` を次の形に書き換えて「Deploy」（古い鍵・新しい鍵のどちらでも通ります）
+
+   ```
+   not (http.request.uri.query contains "k=<古い鍵>" or http.request.uri.query contains "k=<新しい鍵>")
+   ```
+
+3. **Worker**：今の `ACCESS_KEY` の値を、新しく作る Secret `ACCESS_KEY_PREVIOUS` に入れ、`ACCESS_KEY` を新しい鍵に変えて「Deploy」（この間は古い鍵・新しい鍵のどちらでも答えます）
+4. 確かめる：「Worker の鍵」の手順5の `curl.exe` で（URL は今使っているもの）、古い鍵・新しい鍵のどちらでも天気の JSON が返ること
+5. **ワールド**：Unity の **City Url** の鍵を新しいものにしてアップロードする（PC と Quest の両方に出しているときは、VRChat SDK の「Multi-Platform Build & Publish」で両方）
+6. しばらくして（古い版のワールドにいる人が抜けたころ。数日が目安）、WAF の式を新しい鍵だけの形（`not http.request.uri.query contains "k=<新しい鍵>"`）に戻して「Deploy」し、Worker の `ACCESS_KEY_PREVIOUS` を消して「Deploy」
+7. 確かめる：古い鍵では断られ（403）、新しい鍵では天気の JSON が返ること
+
+手順5のアップロードを手順2・3より先にすると、新しい鍵が WAF か Worker に断られ、その間は市区町村の天気が届かずに地域データになります（壊れはしません）。
 
 ### Worker のログをオフにする
 
@@ -167,7 +177,7 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
    - Action：**Block** →「Deploy」
 4. **レート制限ルール**（無料で1つ）：同じ「WAF」→「Rate limiting rules」→「Create rule」
    - Rule name：`連続アクセスを止める`
-   - If incoming requests match：Field `Hostname`、Operator `equals`、Value `weather.<あなたのドメイン>`
+   - If incoming requests match：Field `URI Path`、Operator `equals`、Value `/`（無料プランは Hostname を選べず、パスなどしか使えません。ワールドが使うのは `/` だけです）
    - With the same characteristics：IP（無料プランはこれだけ）
    - When rate exceeds：Requests **10**、Period **10 seconds**（来場者は1時間に1回ほどなので、同じ回線から何人か同時に入っても十分な余裕です）
    - Then take action：**Block**、Duration **10 seconds** →「Deploy」
@@ -182,8 +192,33 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 
 #### 攻撃されているかの見方と、急いで止めたいとき
 
-- Worker の「Metrics」で、1日のリクエスト数が急に増えていないかを見ます。10万回を超えると Cloudflare が error 1027 を返し、ワールドは地域データに切り替わります
-- 独自ドメインがまだないときに急いで止めたいときは、Worker の「Settings」→「Domains & Routes」で **workers.dev** を Disable にします。アクセスが Worker に届かなくなるので枠を使わず、ワールドは地域データに切り替わります（定期更新の起動は続きます）。落ち着いたら Enable に戻します
+**見方**
+
+- Worker の「Metrics」：1日のリクエスト数が急に増えていないか
+- そのドメインの「Security」→「Events」：WAF が止めたアクセスの数と、どこから来ているか。鍵のないアクセスが WAF で止まっているだけなら、Worker も料金も使っていないので様子見で構いません
+- 「Manage Account」→「Billing」の使用量と、予算アラートのメール（Workers Paid のとき）
+
+**プランによる違い**
+
+- **無料プラン**：Worker に届いたアクセスが1日10万回を超えると、Cloudflare が error 1027 を返し、ワールドは地域データに切り替わります（日本時間の朝9時に枠が戻ります）。お金はかかりません
+- **Workers Paid**：1日の上限がなく止まらない代わりに、月1,000万回を超えた分は100万回ごとに 0.30 ドルかかります。使った量で自動的に止める設定はなく、予算アラートは知らせるだけなので、低い金額（1ドルほど）で設定しておきます
+
+**急いで止めたいとき（独自ドメインと WAF があるとき）**
+
+WAF で全部止めるのがいちばん早く、元にも戻しやすい方法です。止めたアクセスでは Worker が動かないので、料金も無料枠も使いません。ワールドは地域データに切り替わるだけで壊れず、定期更新の起動（Cron Trigger）も URL を使わないので動き続けます。
+
+1. そのドメインの「Security」→「WAF」→「Custom rules」→「Create rule」
+2. Rule name：`緊急停止`、「Edit expression」に次を貼り付けて `weather.<あなたのドメイン>` を書き換え、Action：**Block** →「Deploy」
+
+   ```
+   (http.host eq "weather.<あなたのドメイン>")
+   ```
+
+3. 落ち着いたら、ルールの一覧で `緊急停止` のスイッチをオフにする（消さずに残しておくと、次はスイッチ1つで止められます。無料プランのカスタムルールは5つまで）
+
+止めた原因が鍵の出回りなら、止めている間に「鍵を変えるとき」の手順で鍵を変えてから、スイッチをオフにします。
+
+**独自ドメインがまだないとき**：Worker の「Settings」→「Domains & Routes」で **workers.dev** を Disable にします。アクセスが Worker に届かなくなるので枠を使わず、ワールドは地域データに切り替わります（定期更新の起動は続きます）。落ち着いたら Enable に戻します
 
 ### Worker のその他の守り
 
