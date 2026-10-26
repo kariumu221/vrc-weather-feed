@@ -26,6 +26,8 @@
 //   refuses or fails, so a flood from many places can't use up Open-Meteo's free limit. Requests that reach the
 //   Worker still count toward its quota; when that runs out, the world simply uses the GitHub Pages feed until the
 //   quota comes back (00:00 UTC).
+// - On Workers Paid, which has no daily quota and no spending cap, the Cron Trigger's usage check ("Stopping before
+//   the bill grows" below) blocks the address with a WAF rule before the included requests run out.
 // Data: Open-Meteo.com (CC BY 4.0).
 
 const CURRENT_FIELDS = [
@@ -241,10 +243,122 @@ async function startFeedUpdate(env, now) {
   return "started";
 }
 
+// ---- Stopping before the bill grows (Cron Trigger) ----
+// Workers Paid has no spending cap: past the 10 million requests included in a billing period, each further million
+// costs $0.30, and the budget alert only sends an e-mail. So on every Cron Trigger this Worker asks Cloudflare how
+// many requests all Workers in the account have had today (UTC) and, once that reaches USAGE_DAILY_LIMIT, switches
+// on a WAF custom rule that blocks the city weather's address. Blocked requests never reach a Worker, so nothing more
+// is counted or billed, and the world uses the GitHub Pages feed. At 00:00 UTC (09:00 in Japan) the count starts
+// again and the rule is switched off. A billing period has at most 31 days, and 31 x 250,000 = 7.75 million, so the
+// margin to 10 million covers the minutes between a check and the block. Settings > Variables and Secrets:
+//   CF_API_TOKEN      (secret) an API token with "Account Analytics: Read" and "Zone WAF: Edit" for that zone only
+//   CF_ACCOUNT_ID     (text)   the account ID
+//   CF_ZONE_ID        (text)   the zone ID of the domain the city weather uses
+//   USAGE_DAILY_LIMIT (text, optional) requests a day before stopping, if not 250000 (set 1 to test the stop)
+// The rule must already exist, named exactly STOP_RULE_NAME, with the action Block (README); this only switches it
+// on and off. Without the three settings this part does nothing. The token is only ever sent to api.cloudflare.com.
+const STOP_RULE_NAME = "使いすぎ自動停止";
+const USAGE_DAILY_LIMIT = 250000;
+const CF_API = "https://api.cloudflare.com/client/v4";
+const CF_TIMEOUT_MS = 10000;
+const CF_ID = /^[0-9a-f]{32}$/;
+
+// Calls the Cloudflare API with the token and returns the parsed answer; anything but success throws. Only the
+// status and Cloudflare's first error message go into the error, never the token.
+async function cloudflareApi(env, path, init) {
+  const res = await fetchWithin(CF_API + path, Object.assign({}, init, {
+    headers: {
+      "authorization": "Bearer " + env.CF_API_TOKEN,
+      "content-type": "application/json",
+      "user-agent": USER_AGENT,
+    },
+  }), CF_TIMEOUT_MS);
+  let body = null;
+  try {
+    body = await res.json();
+  } catch (e) {
+    body = null;
+  }
+  const errors = body && Array.isArray(body.errors) ? body.errors : [];
+  if (!res.ok || !body || body.success === false || errors.length) {
+    const first = errors.length ? " " + String(errors[0].message || errors[0].code || "").slice(0, 120) : "";
+    throw new Error(`Cloudflare API ${init.method} ${path.split("/").slice(0, 3).join("/")}: ${res.status}${first}`);
+  }
+  return body;
+}
+
+// Requests to all Workers in the account since 00:00 UTC today, as Cloudflare's analytics count them (a minute or
+// two behind). Scheduled runs like this one are counted too.
+async function requestsToday(env, now) {
+  const start = new Date(now);
+  start.setUTCHours(0, 0, 0, 0);
+  const body = await cloudflareApi(env, "/graphql", {
+    method: "POST",
+    body: JSON.stringify({
+      query: "query ($accountTag: string, $start: string, $end: string) { viewer { accounts(filter: {accountTag: $accountTag}) { " +
+        "workersInvocationsAdaptive(limit: 10000, filter: {datetime_geq: $start, datetime_leq: $end}) { sum { requests } } } } }",
+      variables: { accountTag: env.CF_ACCOUNT_ID, start: start.toISOString(), end: new Date(now).toISOString() },
+    }),
+  });
+  const accounts = body.data && body.data.viewer && body.data.viewer.accounts;
+  if (!Array.isArray(accounts) || accounts.length !== 1) throw new Error("Cloudflare analytics did not return the account");
+  const rows = accounts[0].workersInvocationsAdaptive;
+  if (!Array.isArray(rows)) throw new Error("Cloudflare analytics did not return Worker requests");
+  let total = 0;
+  for (const row of rows) {
+    const n = Number(row && row.sum && row.sum.requests);
+    if (!isFinite(n) || n < 0) throw new Error("Cloudflare analytics returned an odd request count");
+    total += n;
+  }
+  return total;
+}
+
+// Switches the stop rule on or off when it isn't already. Only a Block rule with exactly that name is touched.
+async function setStopRule(env, on) {
+  const zone = "/zones/" + env.CF_ZONE_ID;
+  const ruleset = (await cloudflareApi(env, zone + "/rulesets/phases/http_request_firewall_custom/entrypoint", { method: "GET" })).result;
+  const rule = ruleset && Array.isArray(ruleset.rules) ? ruleset.rules.find((r) => r.description === STOP_RULE_NAME) : null;
+  if (!rule) throw new Error(`WAF custom rule "${STOP_RULE_NAME}" not found`);
+  if (rule.action !== "block") throw new Error(`WAF custom rule "${STOP_RULE_NAME}" should have the action Block`);
+  if ((rule.enabled !== false) === on) return on ? "stopped" : "open";
+  // A rule update replaces the whole rule, so everything it has is sent back with only "enabled" changed.
+  const update = Object.assign({}, rule, { enabled: on });
+  delete update.id;
+  delete update.version;
+  delete update.last_updated;
+  await cloudflareApi(env, `${zone}/rulesets/${ruleset.id}/rules/${rule.id}`, { method: "PATCH", body: JSON.stringify(update) });
+  return on ? "stopped now" : "reopened";
+}
+
+async function guardUsage(env, now) {
+  if (!env || !env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID) return "not set up";
+  if (!CF_ID.test(env.CF_ACCOUNT_ID) || !CF_ID.test(env.CF_ZONE_ID)) throw new Error("CF_ACCOUNT_ID and CF_ZONE_ID should be 32-character IDs");
+  const limit = Number(env.USAGE_DAILY_LIMIT) > 0 ? Number(env.USAGE_DAILY_LIMIT) : USAGE_DAILY_LIMIT;
+  return await setStopRule(env, await requestsToday(env, now) >= limit);
+}
+
 export default {
-  // Returns what it did ("not set up", "fresh" or "started"); a failure throws.
+  // The usage check runs on every Cron Trigger (README: every 2 minutes); the feed check only at minutes 0, 10, 20,
+  // ..., as when the trigger ran every 10 minutes. One failing doesn't skip the other; a failure throws at the end,
+  // which marks the run as failed in the Worker's list of past cron events. Returns what each part did.
   async scheduled(controller, env, ctx) {
-    return await startFeedUpdate(env, Date.now());
+    const now = Date.now();
+    const done = [];
+    const failed = [];
+    try {
+      done.push("usage: " + await guardUsage(env, now));
+    } catch (e) {
+      failed.push("usage: " + e.message);
+    }
+    if (new Date((controller && controller.scheduledTime) || now).getUTCMinutes() % 10 === 0) {
+      try {
+        done.push("feed: " + await startFeedUpdate(env, now));
+      } catch (e) {
+        failed.push("feed: " + e.message);
+      }
+    }
+    if (failed.length) throw new Error(failed.join("; "));
+    return done.join(", ");
   },
 
   async fetch(request, env, ctx) {

@@ -139,12 +139,12 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 3. Cloudflare で Worker を開き、「Settings」→「Variables and Secrets」→「Add」で次の2つを入れて「Deploy」を押す
    - Type **Text**、Variable name `GITHUB_REPO`、Value `<GitHubのユーザー名>/<リポジトリ名>`（例：`someone/vrc-weather-feed`）
    - Type **Secret**、Variable name `GITHUB_TOKEN`、Value 手順2のトークン
-4. 同じ「Settings」の「Trigger Events」（画面によっては「Triggers」）→「Add」→「Cron Triggers」で、`*/10 * * * *`（10分ごと）を追加する
+4. 同じ「Settings」の「Trigger Events」（画面によっては「Triggers」）→「Add」→「Cron Triggers」で、`*/10 * * * *`（10分ごと）を追加する。下の「追加料金を出さないための自動停止」も使うときは `*/2 * * * *`（2分ごと）にします（`weather.json` の古さの確認は、2分ごとにしても今までどおり毎時0・10・20…分にだけします）
 5. 確かめる：1時間ほどで、GitHub の「Actions」タブに `workflow_dispatch` の実行が出てくれば完了です。Worker の Cron の過去の実行（Past cron events）で、失敗が続いていないかも見られます
 
 - トークンでできるのは、このリポジトリの Actions（ワークフローの実行・取り消しなど）だけで、コードは変えられません。漏れたかもしれないときは、GitHub でそのトークンを削除してください
 - トークンの期限が切れると Cron の実行が「失敗」になり、GitHub 自身の定期実行だけに戻ります。新しいトークンを作って `GITHUB_TOKEN` を入れ替えてください
-- Worker の無料枠への影響は1日144回で、ほとんどありません。公開リポジトリなので Actions の実行も無料です
+- Worker の無料枠への影響は1日144回（2分ごとなら720回）で、ほとんどありません。公開リポジトリなので Actions の実行も無料です
 - 公開中の `weather.json` が GitHub Pages 以外の場所にあるときは、Text の `FEED_URL` にその URL を入れます。ワークフローが `main` 以外のブランチにあるときは `GITHUB_BRANCH` で指定します
 
 ### DoS（大量アクセス）への対策
@@ -162,6 +162,8 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 #### 3段目の設定（独自ドメインと WAF）
 
 `*.workers.dev` には WAF のルールを付けられないため、Cloudflare に置いた自分のドメインが必要です。
+
+この README の「Security」→「WAF」→「Custom rules」（または「Rate limiting rules」）は、2026年10月の新しい画面では「Security」→「**Security rules**」です。そこで「Create rule」を押して作ります。画面の幅が狭いと、左のメニューは「☰」の中に隠れます。
 
 1. **ドメインを用意する**：持っていなければ、Cloudflare の「Domain Registration」→「Register Domains」で買えます（年1,500円前後から。種類によって違います）。ほかで買ったドメインは、「Add a domain」で Cloudflare に追加し（Free プラン）、案内どおりネームサーバーを切り替えます
 2. **Worker にドメインを付ける**：Worker の「Settings」→「Domains & Routes」→「Add」→「Custom domain」で、`weather.<あなたのドメイン>` のような名前を付ける
@@ -190,6 +192,55 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 - 独自ドメインも VRChat の許可リストにはないので、届くのは今までどおり「Allow Untrusted URLs」をオンにした人だけです
 - Cron Trigger（定期更新の起動）は URL を使わないので、workers.dev を止めても動き続けます
 
+#### 追加料金を出さないための自動停止（Workers Paid のとき）
+
+Workers Paid は、含まれる量（請求期間ごとにリクエスト1,000万回・CPU 3,000万ミリ秒）を超えると、自動では止まらずに追加料金がかかります。そこで Worker が、Cron Trigger のたびに（2分ごと）Cloudflare に「今日（UTC）アカウントの Worker が受けたリクエスト数」を聞き、1日 **25万回**に届いたら、WAF のルール `使いすぎ自動停止` をオンにします。
+
+- 止めたアクセスは Worker に届かないので、それ以上は数えられず、料金もかかりません。ワールドは地域データに切り替わるだけで壊れません
+- 日本時間の朝9時（UTC の0時）に数え直しになり、ルールは自動でオフに戻ります
+- 請求期間は長くても31日なので、毎日25万回まで使われても 775万回で、1,000万回には届きません。残りの余裕は、確認から止めるまでの数分の分です
+- ふだんの使用は1日1,300回ほど（2分ごとの確認を含む）なので、25万回はその200倍ほどです。人気が出て本当の来場者で届きそうになったら、`USAGE_DAILY_LIMIT` で上げられます（31倍して1,000万回を超えない数まで）
+- 1回の CPU 時間にも上限を付けて、CPU の分も含まれる量を超えないようにします（ふだんは1回 2〜3ミリ秒）
+- Cron Trigger は URL を使わないので、止めている間も動き続けます（定期更新の起動もそのまま）
+
+**設定のしかた**（独自ドメインと WAF の設定が済んでいること）
+
+1. 新しい `worker.js` をデプロイする（手順2の4。下の設定が揃うまで、この機能は何もしません）
+2. **止める用の WAF ルールを作る**：そのドメインの「Security」→「WAF」→「Custom rules」→「Create rule」
+   - Rule name：`使いすぎ自動停止`（この名前で探すので、1文字も変えないでください）
+   - 「Edit expression」に次を貼り付けて `weather.<あなたのドメイン>` を書き換える。Action：**Block**
+
+     ```
+     (http.host eq "weather.<あなたのドメイン>")
+     ```
+
+   - Status を **Disabled** にして「Deploy」する（オフのまま作られます。オンにするのは Worker の仕事です）
+3. **Cloudflare の API トークンを作る**：右上のアイコン →「My Profile」→「API Tokens」→「Create Token」→「Custom token」の「Get started」
+   - Token name：わかる名前（例：`vrc-weather-usage-guard`）
+   - Permissions は次の2行だけ（「+ Add more」で2行目を足す）
+     - `Account` ／ `Account Analytics` ／ `Read`
+     - `Zone` ／ `Zone WAF` ／ `Edit`
+   - Account Resources：`Include` ／ 自分のアカウント
+   - Zone Resources：`Include` ／ `Specific zone` ／ 自分のドメイン
+   - Client IP Address Filtering と TTL は空のまま（期限なし）
+   - 「Continue to summary」→「Create Token」を押し、表示されたトークンをコピーする（一度しか表示されません）
+4. **ID を控える**：そのドメインの「Overview」の右下の「API」に、**Zone ID** と **Account ID** があります（どちらも秘密ではありません）
+5. **Worker に設定する**：Worker の「Settings」→「Variables and Secrets」→「Add」で次の3つを入れて「Deploy」
+   - Type **Secret**、Variable name `CF_API_TOKEN`、Value 手順3のトークン
+   - Type **Text**、Variable name `CF_ACCOUNT_ID`、Value Account ID
+   - Type **Text**、Variable name `CF_ZONE_ID`、Value Zone ID
+6. **Cron を2分ごとにする**：同じ「Settings」の「Trigger Events」で、Cron Trigger を `*/2 * * * *` に変える
+7. **CPU 時間の上限を付ける**：同じ「Settings」の「General」（画面によっては「Pricing」）→「CPU Time Limit (ms)」に `50` を入れる。手順6と7の変更は、画面の下に出る「Unsaved changes」の「Deploy」（または「Save」）を押すまで保存されません
+8. **止まるか試す**：Text の変数 `USAGE_DAILY_LIMIT` を `1` で足して「Deploy」する。数分で、WAF のルール一覧の `使いすぎ自動停止` がオンになり、ワールドの City Url（または「Worker の鍵」の手順5の `curl.exe`）が 403 になれば成功です
+9. **戻す**：`USAGE_DAILY_LIMIT` を消して「Deploy」する。数分で `使いすぎ自動停止` がオフに戻り、天気の JSON が返ります
+
+注意：
+
+- `使いすぎ自動停止` のスイッチは手で触らないでください。手でオンにしても、次の確認で（使用量が少なければ）Worker がオフに戻します。急いで止めたいときは、下の `緊急停止` を使います
+- Worker が使用量を読めない・ルールを変えられないとき（トークンを消した、ルールの名前を変えたなど）は、止めも戻しもせず、Cron の過去の実行（Past cron events）が「失敗」になります。トークンは期限なしで作るので、ふつうは切れません
+- トークンでできるのは、アカウントの使用量を読むことと、このドメインの WAF のルールを変えることだけです。漏れたかもしれないときは、「API Tokens」でそのトークンを消して作り直し、`CF_API_TOKEN` を入れ替えてください
+- 予算アラート（1ドルほど）は、念のため残しておきます
+
 #### 攻撃されているかの見方と、急いで止めたいとき
 
 **見方**
@@ -201,7 +252,7 @@ GitHub の定期実行（`schedule`）は混んでいると数時間遅れるた
 **プランによる違い**
 
 - **無料プラン**：Worker に届いたアクセスが1日10万回を超えると、Cloudflare が error 1027 を返し、ワールドは地域データに切り替わります（日本時間の朝9時に枠が戻ります）。お金はかかりません
-- **Workers Paid**：1日の上限がなく止まらない代わりに、月1,000万回を超えた分は100万回ごとに 0.30 ドルかかります。使った量で自動的に止める設定はなく、予算アラートは知らせるだけなので、低い金額（1ドルほど）で設定しておきます
+- **Workers Paid**：1日の上限がなく止まらない代わりに、月1,000万回を超えた分は100万回ごとに 0.30 ドルかかります。Cloudflare には使った量で自動的に止める設定がなく、予算アラートは知らせるだけです。下の「追加料金を出さないための自動停止」を設定し、予算アラートも低い金額（1ドルほど）で残しておきます
 
 **急いで止めたいとき（独自ドメインと WAF があるとき）**
 
@@ -231,6 +282,7 @@ WAF で全部止めるのがいちばん早く、元にも戻しやすい方法�
 - 地名は、タグ・記号の `<` `>`・制御文字を取り除き、40文字までにしてから返す
 - 鍵は SHA-256 にしてから一定時間で比べるので、断るまでの時間から鍵（の長さも）を探れない
 - Cron の設定（`GITHUB_BRANCH`・`FEED_URL`・`GITHUB_REPO`）がおかしな形なら使わない。トークンは `api.github.com` にだけ送り、失敗の記録には状態の番号だけを書く
+- 自動停止の設定（`CF_ACCOUNT_ID`・`CF_ZONE_ID`）が32文字の ID の形でなければ使わない。`CF_API_TOKEN` は `api.cloudflare.com` にだけ送り、失敗の記録には状態の番号と Cloudflare のエラー文だけを書く。名前が `使いすぎ自動停止` で Action が Block のルール以外は変えない
 
 ### GitHub のワークフローの守り
 
