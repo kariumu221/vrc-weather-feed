@@ -38,6 +38,7 @@ jobs:
       contents: write   # only for the empty "keep the schedule alive" commit
     outputs:
       stale: ${{ steps.age.outputs.stale }}
+      age: ${{ steps.age.outputs.age }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -54,6 +55,7 @@ jobs:
           case "$made" in ''|*[!0-9]*) made=0 ;; esac
           age=$(( ($(date +%s) - made) / 60 ))
           echo "Published data is $age minutes old"
+          echo "age=$age" >> "$GITHUB_OUTPUT"
           # Update when it is 50 minutes old or more, when it can't be read (age is huge), or on a manual run
           # (a run started by the Worker passes force=false and goes by the age like the schedule).
           if [ "$age" -ge 50 ] || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE" != "false" ]; }; then
@@ -86,7 +88,7 @@ jobs:
       id-token: write   # to prove to Pages that this workflow is publishing
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy-retry.outputs.page_url || steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,14 +98,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Open-Meteo sometimes can't be reached from GitHub's shared runners for a few minutes. That is not worth
+      # a failure e-mail while the data already online is still fresh (the world copes with hours-old data, and
+      # the next run starts 10 minutes later). The script exits with 3 only when Open-Meteo could not be reached
+      # at all; bad data or a refused request exits with 1 and always fails the run. If the published data is
+      # AGE_LIMIT minutes old or more (or unreadable), an unreachable Open-Meteo fails the run as well, so a real
+      # outage still sends the e-mail, about 2 hours after the last good update.
       - name: Build weather.json
-        run: python scripts/build_weather.py public
+        id: build
+        env:
+          PUBLISHED_AGE: ${{ needs.check.outputs.age }}
+          AGE_LIMIT: "120"
+        run: |
+          rc=0
+          python scripts/build_weather.py public || rc=$?
+          if [ "$rc" -eq 3 ] && [ "${PUBLISHED_AGE:-999999}" -lt "$AGE_LIMIT" ]; then
+            echo "::warning title=Open-Meteo unreachable::Not updated this time; the published data is ${PUBLISHED_AGE} minutes old, so the next run will try again."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
 
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        if: steps.build.outputs.skip != 'true'
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.build.outputs.skip != 'true'
         with:
           path: public
 
+      # deploy-pages now and then fails on GitHub's side ("No artifacts named github-pages were found",
+      # "Fetching artifact metadata failed"). The same step works a moment later, so try once more.
       - id: deploy
+        if: steps.build.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Wait before trying to publish again
+        if: steps.deploy.outcome == 'failure'
+        run: sleep 45
+
+      - id: deploy-retry
+        if: steps.deploy.outcome == 'failure'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

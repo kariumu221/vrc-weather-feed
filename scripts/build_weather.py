@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -89,6 +90,16 @@ CURRENT_FIELDS = [
 ]
 
 
+# Open-Meteo answers in a second or two; a request that is still silent after 20 s is a stuck connection, and a
+# new one usually works. So: short tries, many of them, with growing pauses (about 4 minutes in the worst case).
+FETCH_TIMEOUT = 20          # seconds per try
+FETCH_TRIES = 6
+FETCH_WAITS = [5, 10, 20, 40, 60]   # pause after try 1, 2, 3, ...
+# Exit code when Open-Meteo could not be reached at all (timeouts, 429, 5xx). The workflow treats it as a
+# warning while the published data is still fresh; every other failure (bad data, refused request) exits 1.
+EXIT_UNREACHABLE = 3
+
+
 def fetch_current(locations):
     params = {
         "latitude": ",".join(f"{l[1]:.2f}" for l in locations),
@@ -99,15 +110,33 @@ def fetch_current(locations):
     }
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params, safe=",")
     req = urllib.request.Request(url, headers={"User-Agent": "VRChat-WeatherFeed/1.0"})
-    for attempt in range(3):
+    last = "no attempt"
+    for attempt in range(FETCH_TRIES):
+        wait = FETCH_WAITS[min(attempt, len(FETCH_WAITS) - 1)]
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            started = time.monotonic()
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
                 data = json.load(resp)
+            if attempt:
+                print(f"fetch attempt {attempt + 1} succeeded in {time.monotonic() - started:.1f}s")
             return data if isinstance(data, list) else [data]
-        except Exception as exc:  # network hiccup: retry a couple of times
-            print(f"fetch attempt {attempt + 1} failed: {exc}", file=sys.stderr)
-            time.sleep(10)
-    raise SystemExit("Open-Meteo request failed")
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code} {exc.reason}"
+            if 400 <= exc.code < 500 and exc.code != 429:
+                # Our own request is wrong (or refused for good): retrying will not help, and it is not a hiccup.
+                raise SystemExit(f"Open-Meteo refused the request: {last}")
+            if exc.code == 429:  # rate limited: do what the server asks (within reason)
+                try:
+                    wait = max(wait, min(int(exc.headers.get("Retry-After", "0")), 90))
+                except ValueError:
+                    pass
+        except Exception as exc:  # timeout, connection reset, DNS, cut-off or garbled body: all short-lived
+            last = f"{type(exc).__name__}: {exc}"
+        print(f"fetch attempt {attempt + 1}/{FETCH_TRIES} failed: {last}", file=sys.stderr)
+        if attempt + 1 < FETCH_TRIES:
+            time.sleep(wait)
+    print(f"Open-Meteo could not be reached after {FETCH_TRIES} tries: {last}", file=sys.stderr)
+    sys.exit(EXIT_UNREACHABLE)
 
 
 def num(value, digits=1):
